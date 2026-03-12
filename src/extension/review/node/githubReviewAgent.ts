@@ -204,12 +204,12 @@ export async function githubReview(
 ): Promise<FeedbackResult> {
 	const git = gitExtensionService.getExtensionApi();
 	if (!git) {
-		return { type: 'success', comments: [] };
+		return { type: 'error', severity: 'info', reason: l10n.t('Git is not available. Please ensure the Git extension is enabled.') };
 	}
 	const changes = await collectChanges(git, group, editor, workspaceService);
 
 	if (!changes.length) {
-		return { type: 'success', comments: [] };
+		return { type: 'success', comments: [], reason: l10n.t('No changes were found to review. If reviewing a file, make sure it has been saved and contains uncommitted changes.') };
 	}
 
 	const ignored = await Promise.all(changes.map(i => ignoreService.isCopilotIgnored(i.document.uri)));
@@ -317,7 +317,7 @@ export async function githubReviewFileUris(
 	}
 
 	if (!changes.length) {
-		return { type: 'success', comments: [] };
+		return { type: 'success', comments: [], reason: l10n.t('No changes were found to review. If reviewing a file, make sure it has been saved and contains uncommitted changes.') };
 	}
 
 	const ignored = await Promise.all(changes.map(c => ignoreService.isCopilotIgnored(c.uri)));

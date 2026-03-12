@@ -4,10 +4,11 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as l10n from '@vscode/l10n';
-import type { Selection, TextEditor, Uri } from 'vscode';
+import type { QuickPickItem, Selection, TextEditor, Uri } from 'vscode';
 import { IAuthenticationService } from '../../../platform/authentication/common/authentication';
 import { ICustomInstructionsService } from '../../../platform/customInstructions/common/customInstructionsService';
 import { TextDocumentSnapshot } from '../../../platform/editing/common/textDocumentSnapshot';
+import { IDialogService } from '../../../platform/dialog/common/dialogService';
 import { ICAPIClientService } from '../../../platform/endpoint/common/capiClient';
 import { IDomainService } from '../../../platform/endpoint/common/domainService';
 import { IEnvService } from '../../../platform/env/common/envService';
@@ -94,6 +95,11 @@ export async function handleReviewResult(
 // This ensures that starting a new review cancels any previous in-progress review.
 let inProgress: CancellationTokenSource | undefined;
 
+/** @internal Exposed for testing only. Sets the module-level inProgress state. */
+export function _setInProgressForTesting(tokenSource: CancellationTokenSource | undefined): void {
+	inProgress = tokenSource;
+}
+
 export class ReviewSession {
 
 	constructor(
@@ -112,6 +118,7 @@ export class ReviewSession {
 		@IWorkspaceService private readonly workspaceService: IWorkspaceService,
 		@INotificationService private readonly notificationService: INotificationService,
 		@ICustomInstructionsService private readonly customInstructionsService: ICustomInstructionsService,
+		@IDialogService private readonly dialogService: IDialogService,
 	) { }
 
 	async review(
@@ -126,7 +133,11 @@ export class ReviewSession {
 		const editor = this.tabsAndEditorsService.activeTextEditor;
 		const selection = await this.resolveSelection(group, editor);
 		if (group === 'selection' && selection === undefined) {
-			return undefined;
+			const picked = await this.showReviewScopePicker(editor);
+			if (!picked) {
+				return undefined;
+			}
+			group = picked;
 		}
 
 		const title = getReviewTitle(group, editor);
@@ -143,6 +154,35 @@ export class ReviewSession {
 			return false;
 		}
 		return true;
+	}
+
+	/**
+	 * Shows a quick pick to let the user choose a review scope when no selection is available.
+	 * @returns The chosen ReviewGroup, or undefined if the user dismissed the picker
+	 */
+	private async showReviewScopePicker(editor: TextEditor | undefined): Promise<ReviewGroup | undefined> {
+		interface ReviewScopeItem extends QuickPickItem {
+			readonly group: ReviewGroup;
+		}
+
+		const items: ReviewScopeItem[] = [];
+		if (editor) {
+			items.push({
+				label: l10n.t('$(file) Current File'),
+				description: path.posix.basename(editor.document.uri.path),
+				group: 'selection',
+			});
+		}
+		items.push(
+			{ label: l10n.t('$(diff) Unstaged Changes'), group: 'workingTree' },
+			{ label: l10n.t('$(check) Staged Changes'), group: 'index' },
+			{ label: l10n.t('$(git-commit) All Uncommitted Changes'), group: 'all' },
+		);
+
+		const picked = await this.dialogService.showQuickPick(items, {
+			placeHolder: l10n.t('Select a scope for code review'),
+		});
+		return picked?.group;
 	}
 
 	/**
@@ -189,14 +229,25 @@ export class ReviewSession {
 		progressLocation: ProgressLocation,
 		cancellationToken?: CancellationToken
 	): Promise<FeedbackResult | undefined> {
+		if (inProgress) {
+			const existingReview = inProgress;
+			const continueButton = l10n.t('Continue');
+			const result = await this.notificationService.showInformationMessage(
+				l10n.t('A code review is already in progress. Starting a new review will cancel it.'),
+				{ modal: true },
+				continueButton
+			);
+			if (result !== continueButton) {
+				return undefined;
+			}
+			existingReview.cancel();
+		}
+
 		return this.notificationService.withProgress({
 			location: progressLocation,
 			title,
 			cancellable: true,
 		}, async (_progress, progressToken) => {
-			if (inProgress) {
-				inProgress.cancel();
-			}
 			const tokenSource = inProgress = new CancellationTokenSource(
 				cancellationToken ? combineCancellationTokens(cancellationToken, progressToken) : progressToken
 			);

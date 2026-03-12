@@ -5,9 +5,10 @@
 
 import assert from 'assert';
 import { afterEach, beforeEach, describe, suite, test } from 'vitest';
-import type { Selection, TextEditor } from 'vscode';
+import type { OpenDialogOptions, QuickPickItem, QuickPickOptions, Selection, TextEditor, Uri } from 'vscode';
 import { IAuthenticationService } from '../../../../platform/authentication/common/authentication';
 import { CopilotToken, createTestExtendedTokenInfo } from '../../../../platform/authentication/common/copilotToken';
+import { IDialogService } from '../../../../platform/dialog/common/dialogService';
 import { IGitExtensionService } from '../../../../platform/git/common/gitExtensionService';
 import { NullGitExtensionService } from '../../../../platform/git/common/nullGitExtensionService';
 import { ILogService } from '../../../../platform/log/common/logService';
@@ -23,7 +24,7 @@ import { URI } from '../../../../util/vs/base/common/uri';
 import { SyncDescriptor } from '../../../../util/vs/platform/instantiation/common/descriptors';
 import { IInstantiationService } from '../../../../util/vs/platform/instantiation/common/instantiation';
 import type { FeedbackResult } from '../../../prompt/node/feedbackGenerator';
-import { combineCancellationTokens, getReviewTitle, HandleResultDependencies, handleReviewResult, ReviewGroup, ReviewSession } from '../doReview';
+import { combineCancellationTokens, getReviewTitle, HandleResultDependencies, handleReviewResult, ReviewGroup, ReviewSession, _setInProgressForTesting } from '../doReview';
 
 interface MockDeps extends HandleResultDependencies {
 	infoMessages: Array<{ message: string; options?: unknown; items?: string[] }>;
@@ -374,6 +375,9 @@ suite('doReview', () => {
 			_serviceBrand: undefined;
 			quotaDialogShown = false;
 			infoMessages: string[] = [];
+			infoButtonToReturn: string | undefined = undefined;
+			warningMessages: string[] = [];
+			warningButtonToReturn: string | undefined = undefined;
 			progressCallback: ((progress: Progress<{ message?: string; increment?: number }>, token: CancellationToken) => Promise<unknown>) | null = null;
 
 			async showQuotaExceededDialog(_options: { isNoAuthUser: boolean }): Promise<void> {
@@ -384,7 +388,14 @@ suite('doReview', () => {
 			showInformationMessage<T extends string>(message: string, options: MessageOptions, ...items: T[]): Promise<T | undefined>;
 			showInformationMessage(message: string, _optionsOrItem?: MessageOptions | string, ..._items: string[]): Promise<string | undefined> {
 				this.infoMessages.push(message);
-				return Promise.resolve(undefined);
+				return Promise.resolve(this.infoButtonToReturn);
+			}
+
+			showWarningMessage(message: string, ...items: string[]): Promise<string | undefined>;
+			showWarningMessage<T extends string>(message: string, options: MessageOptions, ...items: T[]): Promise<T | undefined>;
+			showWarningMessage(message: string, _optionsOrItem?: MessageOptions | string, ..._items: string[]): Promise<string | undefined> {
+				this.warningMessages.push(message);
+				return Promise.resolve(this.warningButtonToReturn);
 			}
 
 			async withProgress<T>(
@@ -430,6 +441,19 @@ suite('doReview', () => {
 			getActiveNotebookEditor() { return undefined; }
 		}
 
+		// Mock dialog service that returns undefined from showQuickPick (user dismissed)
+		class MockDialogService implements IDialogService {
+			_serviceBrand: undefined;
+			itemToReturn: QuickPickItem | undefined = undefined;
+
+			showQuickPick<T extends QuickPickItem>(_items: readonly T[] | Thenable<readonly T[]>, _options: QuickPickOptions, _token?: unknown): Thenable<T | undefined> {
+				return Promise.resolve(this.itemToReturn as T | undefined);
+			}
+			showOpenDialog(_options: OpenDialogOptions): Thenable<Uri[] | undefined> {
+				return Promise.resolve(undefined);
+			}
+		}
+
 		beforeEach(() => {
 			store = new DisposableStore();
 			serviceCollection = store.add(createPlatformServices(store));
@@ -437,6 +461,7 @@ suite('doReview', () => {
 			// Add required services not in createPlatformServices
 			serviceCollection.define(IReviewService, new SyncDescriptor(MockReviewService));
 			serviceCollection.define(IGitExtensionService, new SyncDescriptor(NullGitExtensionService));
+			serviceCollection.define(IDialogService, new SyncDescriptor(MockDialogService));
 		});
 
 		afterEach(() => {
@@ -634,9 +659,9 @@ suite('doReview', () => {
 			// 'index' group doesn't require editor, should proceed
 			const result = await session.review('index', ProgressLocation.Notification);
 
-			// Should complete (git returns empty since NullGitExtensionService)
+			// Should complete (NullGitExtensionService returns no git API, so we get an error)
 			assert.ok(result);
-			assert.strictEqual(result.type, 'success');
+			assert.strictEqual(result.type, 'error');
 		});
 
 		test('returns error result when getCopilotToken throws', async () => {
@@ -724,6 +749,108 @@ suite('doReview', () => {
 			assert.ok(result);
 			// The legacy path is triggered with extracted group (coverage achieved)
 			assert.ok(result.type === 'success' || result.type === 'error');
+		});
+		test('shows scope picker when selection group resolves to undefined', async () => {
+			const mockAuth = new MockAuthService();
+			mockAuth.copilotToken = new CopilotToken(createTestExtendedTokenInfo({ token: 'test' }));
+
+			const mockEditor = {
+				document: { uri: URI.file('/test/file.ts') },
+				selection: { isEmpty: true }
+			} as unknown as TextEditor;
+
+			const mockTabs = new MockTabsAndEditorsService();
+			mockTabs.activeTextEditor = mockEditor;
+
+			const mockScope = new MockScopeSelector();
+			mockScope.selectionToReturn = undefined;
+
+			serviceCollection.define(IAuthenticationService, mockAuth as unknown as IAuthenticationService);
+			serviceCollection.define(ITabsAndEditorsService, mockTabs as unknown as ITabsAndEditorsService);
+			serviceCollection.define(IScopeSelector, mockScope as unknown as IScopeSelector);
+
+			const accessor = serviceCollection.createTestingAccessor();
+			instantiationService = accessor.get(IInstantiationService);
+
+			const session = instantiationService.createInstance(ReviewSession);
+			// The default mock IDialogService.showQuickPick returns undefined (user dismissed)
+			const result = await session.review('selection', ProgressLocation.Notification);
+
+			assert.strictEqual(result, undefined);
+		});
+
+		test('shows warning when cancelling an existing in-progress review', async () => {
+			const mockAuth = new MockAuthService();
+			mockAuth.copilotToken = new CopilotToken(createTestExtendedTokenInfo({ token: 'test', code_review_enabled: true }));
+			mockAuth.tokenToReturn = mockAuth.copilotToken;
+
+			const mockTabs = new MockTabsAndEditorsService();
+			mockTabs.activeTextEditor = undefined;
+
+			const mockNotification = new MockNotificationService();
+
+			serviceCollection.define(IAuthenticationService, mockAuth as unknown as IAuthenticationService);
+			serviceCollection.define(ITabsAndEditorsService, mockTabs as unknown as ITabsAndEditorsService);
+			serviceCollection.define(INotificationService, mockNotification as unknown as INotificationService);
+
+			const accessor = serviceCollection.createTestingAccessor();
+			instantiationService = accessor.get(IInstantiationService);
+
+			// Simulate an in-progress review by setting the module-level state
+			const existingTokenSource = new CancellationTokenSource();
+			_setInProgressForTesting(existingTokenSource);
+
+			try {
+				const session = instantiationService.createInstance(ReviewSession);
+				const result = await session.review('index', ProgressLocation.Notification);
+
+				// User dismissed the warning (mockNotification returns undefined by default)
+				// so the review should be cancelled
+				assert.strictEqual(result, undefined);
+				assert.ok(mockNotification.infoMessages.length > 0, 'Should have shown an info message');
+				assert.ok(mockNotification.infoMessages.some(m => m.includes('already in progress')));
+				// The existing review should NOT have been cancelled since user dismissed
+				assert.strictEqual(existingTokenSource.token.isCancellationRequested, false);
+			} finally {
+				_setInProgressForTesting(undefined);
+				existingTokenSource.dispose();
+			}
+		});
+
+		test('proceeds with new review when user confirms cancelling existing review', async () => {
+			const mockAuth = new MockAuthService();
+			mockAuth.copilotToken = new CopilotToken(createTestExtendedTokenInfo({ token: 'test', code_review_enabled: true }));
+			mockAuth.tokenToReturn = mockAuth.copilotToken;
+
+			const mockTabs = new MockTabsAndEditorsService();
+			mockTabs.activeTextEditor = undefined;
+
+			const mockNotification = new MockNotificationService();
+			mockNotification.infoButtonToReturn = 'Continue';
+
+			serviceCollection.define(IAuthenticationService, mockAuth as unknown as IAuthenticationService);
+			serviceCollection.define(ITabsAndEditorsService, mockTabs as unknown as ITabsAndEditorsService);
+			serviceCollection.define(INotificationService, mockNotification as unknown as INotificationService);
+
+			const accessor = serviceCollection.createTestingAccessor();
+			instantiationService = accessor.get(IInstantiationService);
+
+			// Simulate an in-progress review
+			const existingTokenSource = new CancellationTokenSource();
+			_setInProgressForTesting(existingTokenSource);
+
+			try {
+				const session = instantiationService.createInstance(ReviewSession);
+				const result = await session.review('index', ProgressLocation.Notification);
+
+				// User confirmed, so the review should proceed and the existing review was cancelled
+				assert.ok(result);
+				assert.ok(mockNotification.infoMessages.some(m => m.includes('already in progress')));
+				assert.strictEqual(existingTokenSource.token.isCancellationRequested, true);
+			} finally {
+				_setInProgressForTesting(undefined);
+				existingTokenSource.dispose();
+			}
 		});
 	});
 });
