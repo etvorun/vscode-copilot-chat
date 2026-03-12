@@ -6,11 +6,14 @@
 import * as fs from 'fs';
 import * as vscode from 'vscode';
 import { IChatDebugFileLoggerService } from '../../../platform/chat/common/chatDebugFileLoggerService';
+import { ConfigKey, IConfigurationService } from '../../../platform/configuration/common/configurationService';
 import { IVSCodeExtensionContext } from '../../../platform/extContext/common/extensionContext';
 import { createDirectoryIfNotExists, IFileSystemService } from '../../../platform/filesystem/common/fileSystemService';
 import { ILogService } from '../../../platform/log/common/logService';
 import { CopilotChatAttr, GenAiAttr, GenAiOperationName } from '../../../platform/otel/common/index';
 import { ICompletedSpanData, IOTelService, ISpanEventData, SpanStatusCode } from '../../../platform/otel/common/otelService';
+import { IExperimentationService } from '../../../platform/telemetry/common/nullExperimentationService';
+import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
 import { Disposable } from '../../../util/vs/base/common/lifecycle';
 import { extUriBiasedIgnorePathCase } from '../../../util/vs/base/common/resources';
 import { URI } from '../../../util/vs/base/common/uri';
@@ -24,9 +27,18 @@ const MAX_PENDING_CORE_EVENTS = 100;
 
 interface IActiveLogSession {
 	readonly uri: URI;
+	/** The directory containing this session's log files */
+	readonly sessionDir: URI;
 	readonly buffer: string[];
 	flushPromise: Promise<void>;
 	dirEnsured: boolean;
+	bytesWritten: number;
+	/** Parent session ID if this is a child session (e.g., title, categorization) */
+	readonly parentSessionId?: string;
+	/** Label for child sessions (e.g., 'title', 'categorization') */
+	readonly label?: string;
+	/** Whether this session has received its own OTel spans (vs being auto-created as a parent ref) */
+	hasOwnSpans: boolean;
 }
 
 /**
@@ -40,7 +52,7 @@ interface IDebugLogEntry {
 	/** Chat session ID */
 	readonly sid: string;
 	/** Event type */
-	readonly type: 'tool_call' | 'llm_request' | 'user_message' | 'agent_response' | 'subagent' | 'discovery' | 'error' | 'generic';
+	readonly type: 'tool_call' | 'llm_request' | 'user_message' | 'agent_response' | 'subagent' | 'discovery' | 'error' | 'generic' | 'child_session_ref';
 	/** Descriptive name */
 	readonly name: string;
 	/** Span or event ID */
@@ -59,17 +71,30 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 	public readonly id = 'chatDebugFileLogger';
 
 	private readonly _activeSessions = new Map<string, IActiveLogSession>();
+	/** Maps child session ID → { parentSessionId, label } for child session routing */
+	private readonly _childSessionMap = new Map<string, { parentSessionId: string; label: string }>();
 	private readonly _pendingCoreEvents: IDebugLogEntry[] = [];
 	private _debugLogsDirUri: URI | undefined;
 	private _autoFlushTimer: ReturnType<typeof setInterval> | undefined;
+	private _totalBytesWritten = 0;
+	private _totalSessionCount = 0;
 
 	constructor(
 		@IOTelService private readonly _otelService: IOTelService,
 		@IFileSystemService private readonly _fileSystemService: IFileSystemService,
 		@IVSCodeExtensionContext private readonly _extensionContext: IVSCodeExtensionContext,
 		@ILogService private readonly _logService: ILogService,
+		@IConfigurationService private readonly _configurationService: IConfigurationService,
+		@IExperimentationService private readonly _experimentationService: IExperimentationService,
+		@ITelemetryService private readonly _telemetryService: ITelemetryService,
 	) {
 		super();
+
+		const enabled = this._configurationService.getExperimentBasedConfig(ConfigKey.TeamInternal.ChatDebugFileLogging, this._experimentationService);
+		if (!enabled) {
+			this._telemetryService.sendTelemetryEvent('chatDebugFileLogger.disabled', { github: false, microsoft: true });
+			return;
+		}
 
 		// Subscribe to OTel span completions
 		this._register(this._otelService.onDidCompleteSpan(span => {
@@ -94,6 +119,11 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 			clearInterval(this._autoFlushTimer);
 			this._autoFlushTimer = undefined;
 		}
+		// Accumulate any remaining active session bytes before emitting telemetry
+		for (const session of this._activeSessions.values()) {
+			this._totalBytesWritten += session.bytesWritten;
+		}
+		this._telemetryService.sendTelemetryEvent('chatDebugFileLogger.end', { github: false, microsoft: true }, undefined, { totalBytesWritten: this._totalBytesWritten, sessionCount: this._totalSessionCount });
 		super.dispose();
 	}
 
@@ -110,35 +140,93 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 	}
 
 	async startSession(sessionId: string): Promise<void> {
-		this._ensureSession(sessionId);
+		this._ensureSession(sessionId, /* hasOwnSpans */ true);
 	}
 
 	/**
 	 * Synchronously ensure a session exists for buffering. Directory creation
 	 * and old-log cleanup are deferred to the first flush.
+	 *
+	 * Sessions are organized in directories:
+	 * - Parent session: `debug-logs/<sessionId>/main.jsonl`
+	 * - Child session: `debug-logs/<parentSessionId>/<label>-<childSessionId>.jsonl`
 	 */
-	private _ensureSession(sessionId: string): void {
-		if (this._activeSessions.has(sessionId)) {
+	private _ensureSession(sessionId: string, hasOwnSpans = false): void {
+		const existing = this._activeSessions.get(sessionId);
+		if (existing) {
+			// Mark that this session now has its own spans (upgrades from auto-created parent ref)
+			if (hasOwnSpans && !existing.hasOwnSpans) {
+				existing.hasOwnSpans = true;
+				// Now that we know this is a real session, replay pending core events
+				if (!existing.parentSessionId) {
+					for (const entry of this._pendingCoreEvents) {
+						this._bufferEntry(sessionId, { ...entry, sid: sessionId });
+					}
+				}
+			}
 			return;
 		}
+
+		this._totalSessionCount++;
 
 		const dir = this._getDebugLogsDir();
 		if (!dir) {
 			return;
 		}
 
-		const fileUri = URI.joinPath(dir, `${sessionId}.jsonl`);
+		const childInfo = this._childSessionMap.get(sessionId);
+		let sessionDir: URI;
+		let fileUri: URI;
+
+		if (childInfo) {
+			// Child session — write under parent's directory
+			sessionDir = URI.joinPath(dir, childInfo.parentSessionId);
+			const fileName = `${childInfo.label}-${sessionId}.jsonl`;
+			fileUri = URI.joinPath(sessionDir, fileName);
+
+			// Ensure parent session exists so we can write a cross-reference
+			this._ensureSession(childInfo.parentSessionId);
+
+			// Write a cross-reference entry in the parent's main.jsonl
+			this._bufferEntry(childInfo.parentSessionId, {
+				ts: Date.now(),
+				dur: 0,
+				sid: childInfo.parentSessionId,
+				type: 'child_session_ref',
+				name: childInfo.label,
+				spanId: `child-ref-${sessionId}`,
+				status: 'ok',
+				attrs: {
+					childSessionId: sessionId,
+					childLogFile: `${childInfo.label}-${sessionId}.jsonl`,
+					label: childInfo.label,
+				},
+			});
+		} else {
+			// Parent session — write as main.jsonl in its own directory
+			sessionDir = URI.joinPath(dir, sessionId);
+			fileUri = URI.joinPath(sessionDir, 'main.jsonl');
+		}
+
 		const session: IActiveLogSession = {
 			uri: fileUri,
+			sessionDir,
 			buffer: [],
 			flushPromise: Promise.resolve(),
 			dirEnsured: false,
+			bytesWritten: 0,
+			parentSessionId: childInfo?.parentSessionId,
+			label: childInfo?.label,
+			hasOwnSpans,
 		};
 		this._activeSessions.set(sessionId, session);
 
-		// Replay any core events that fired before this session started
-		for (const entry of this._pendingCoreEvents) {
-			this._bufferEntry(sessionId, { ...entry, sid: sessionId });
+		// Replay pending core events only for parent sessions that have their own spans
+		// (not for sessions auto-created as a side effect of child parent references)
+		if (!childInfo && hasOwnSpans) {
+			for (const entry of this._pendingCoreEvents) {
+				this._bufferEntry(sessionId, { ...entry, sid: sessionId });
+			}
 		}
 
 		// Start auto-flush timer if this is the first active session
@@ -152,6 +240,10 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 
 	async endSession(sessionId: string): Promise<void> {
 		await this.flush(sessionId);
+		const session = this._activeSessions.get(sessionId);
+		if (session) {
+			this._totalBytesWritten += session.bytesWritten;
+		}
 		this._activeSessions.delete(sessionId);
 
 		// Stop auto-flush timer if no active sessions remain
@@ -167,6 +259,14 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 			return;
 		}
 
+		// Skip flushing for parent sessions that were auto-created as parent
+		// references by child sessions (e.g., subagent VS Code sessions).
+		// These have no meaningful content of their own.
+		if (!session.parentSessionId && !session.hasOwnSpans) {
+			session.buffer.length = 0;
+			return;
+		}
+
 		const lines = session.buffer.splice(0);
 		const content = lines.join('');
 
@@ -179,6 +279,10 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 
 	getLogPath(sessionId: string): URI | undefined {
 		return this._activeSessions.get(sessionId)?.uri;
+	}
+
+	getSessionDir(sessionId: string): URI | undefined {
+		return this._activeSessions.get(sessionId)?.sessionDir;
 	}
 
 	getActiveSessionIds(): string[] {
@@ -201,8 +305,15 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 			return;
 		}
 
+		// Check if this span carries parent session info (e.g., title, categorization)
+		const parentChatSessionId = asString(span.attributes[CopilotChatAttr.PARENT_CHAT_SESSION_ID]);
+		const debugLogLabel = asString(span.attributes[CopilotChatAttr.DEBUG_LOG_LABEL]);
+		if (parentChatSessionId && debugLogLabel && !this._childSessionMap.has(sessionId)) {
+			this._childSessionMap.set(sessionId, { parentSessionId: parentChatSessionId, label: debugLogLabel });
+		}
+
 		// Auto-start session on first span seen for this session ID
-		this._ensureSession(sessionId);
+		this._ensureSession(sessionId, /* hasOwnSpans */ true);
 
 		const entry = this._spanToEntry(span, sessionId);
 		if (entry) {
@@ -245,13 +356,15 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 			return;
 		}
 
-		// Span events don't carry chat_session_id — write to all active sessions
-		const activeSessions = [...this._activeSessions.keys()];
-		if (activeSessions.length === 0) {
+		// Span events don't carry chat_session_id — write to parent sessions that have their own spans
+		const parentSessions = [...this._activeSessions.entries()]
+			.filter(([, session]) => !session.parentSessionId && session.hasOwnSpans)
+			.map(([id]) => id);
+		if (parentSessions.length === 0) {
 			return;
 		}
 
-		for (const sessionId of activeSessions) {
+		for (const sessionId of parentSessions) {
 			const entry: IDebugLogEntry = {
 				ts: event.timestamp,
 				dur: 0,
@@ -304,8 +417,11 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 			this._pendingCoreEvents.shift();
 		}
 		this._pendingCoreEvents.push(entry);
-		for (const sessionId of this._activeSessions.keys()) {
-			this._bufferEntry(sessionId, { ...entry, sid: sessionId });
+		// Only write to parent sessions that have their own spans
+		for (const [sessionId, session] of this._activeSessions.entries()) {
+			if (!session.parentSessionId && session.hasOwnSpans) {
+				this._bufferEntry(sessionId, { ...entry, sid: sessionId });
+			}
 		}
 	}
 
@@ -439,13 +555,11 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 	private async _writeToFile(session: IActiveLogSession, content: string): Promise<void> {
 		try {
 			if (!session.dirEnsured) {
-				const dir = this._getDebugLogsDir();
-				if (dir) {
-					await createDirectoryIfNotExists(this._fileSystemService, dir);
-				}
+				await createDirectoryIfNotExists(this._fileSystemService, session.sessionDir);
 				session.dirEnsured = true;
 			}
 			await fs.promises.appendFile(session.uri.fsPath, content, 'utf-8');
+			session.bytesWritten += Buffer.byteLength(content, 'utf-8');
 		} catch (err) {
 			this._logService.error('[ChatDebugFileLogger] Failed to write debug log entries', err);
 		}
@@ -465,41 +579,45 @@ export class ChatDebugFileLoggerService extends Disposable implements IChatDebug
 
 		try {
 			const entries = await this._fileSystemService.readDirectory(dir);
-			const jsonlFiles = entries.filter(([name, type]) => name.endsWith('.jsonl') && type === 1 /* FileType.File */);
+			// Count both directories (new format) and legacy .jsonl files (old format)
+			const sessionEntries = entries.filter(([name, type]) =>
+				(type === 2 /* FileType.Directory */) ||
+				(name.endsWith('.jsonl') && type === 1 /* FileType.File */)
+			);
 
-			if (jsonlFiles.length <= MAX_RETAINED_LOGS) {
+			if (sessionEntries.length <= MAX_RETAINED_LOGS) {
 				return;
 			}
 
-			const fileStats = await Promise.all(
-				jsonlFiles.map(async ([name]) => {
-					const fileUri = URI.joinPath(dir, name);
-					const sessionIdFromFile = name.replace('.jsonl', '');
+			const entryStats = await Promise.all(
+				sessionEntries.map(async ([name, type]) => {
+					const entryUri = URI.joinPath(dir, name);
+					const sessionIdFromEntry = name.replace('.jsonl', '');
 					try {
-						const stat = await this._fileSystemService.stat(fileUri);
-						return { name, uri: fileUri, mtime: stat.mtime, sessionId: sessionIdFromFile };
+						const stat = await this._fileSystemService.stat(entryUri);
+						return { name, uri: entryUri, mtime: stat.mtime, sessionId: sessionIdFromEntry, isDir: type === 2 };
 					} catch {
-						return { name, uri: fileUri, mtime: 0, sessionId: sessionIdFromFile };
+						return { name, uri: entryUri, mtime: 0, sessionId: sessionIdFromEntry, isDir: type === 2 };
 					}
 				}),
 			);
 
-			fileStats.sort((a, b) => a.mtime - b.mtime);
+			entryStats.sort((a, b) => a.mtime - b.mtime);
 
-			const toDelete = fileStats.length - MAX_RETAINED_LOGS;
+			const toDelete = entryStats.length - MAX_RETAINED_LOGS;
 			let deleted = 0;
-			for (const file of fileStats) {
+			for (const entry of entryStats) {
 				if (deleted >= toDelete) {
 					break;
 				}
-				if (this._activeSessions.has(file.sessionId)) {
+				if (this._activeSessions.has(entry.sessionId)) {
 					continue;
 				}
 				try {
-					await this._fileSystemService.delete(file.uri);
+					await this._fileSystemService.delete(entry.uri, { recursive: true });
 					deleted++;
 				} catch {
-					this._logService.warn(`[ChatDebugFileLogger] Failed to delete old debug log: ${file.name}`);
+					this._logService.warn(`[ChatDebugFileLogger] Failed to delete old debug log: ${entry.name}`);
 				}
 			}
 		} catch {
